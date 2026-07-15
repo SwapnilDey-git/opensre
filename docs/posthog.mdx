@@ -1,15 +1,27 @@
 ---
 title: "PostHog (Bounce Rate)"
-description: "Connect the PostHog REST integration so OpenSRE can monitor session bounce rates and trigger watchdog alerts"
+description: "Configure the PostHog REST client for session bounce-rate HogQL queries and threshold evaluation"
 ---
 
-OpenSRE queries PostHog session metrics to calculate bounce rates and trigger alerts when the percentage of short sessions exceeds your configured threshold.
+OpenSRE includes a PostHog REST client that queries **your** PostHog project's session data via HogQL and evaluates bounce-rate thresholds. Configure it with `POSTHOG_*` environment variables.
 
-This integration uses the PostHog REST API to fetch session telemetry during SRE watchdog cycles. 
+## Which PostHog integration do I need?
+
+OpenSRE touches PostHog in three separate ways. They use different credentials and serve different purposes:
+
+| Integration | Purpose | Configuration |
+| --- | --- | --- |
+| **PostHog (Bounce Rate)** — this page | REST client that queries session bounce rates in your PostHog project | `POSTHOG_PROJECT_ID`, `POSTHOG_PERSONAL_API_KEY`, and related `POSTHOG_*` vars |
+| [PostHog (MCP)](/posthog-mcp) | Agent tools during investigations (analytics, flags, HogQL, error tracking) | `POSTHOG_MCP_*` vars or `opensre integrations setup posthog_mcp` |
+| OpenSRE product telemetry | Optional usage analytics from the interactive shell (`$ai_generation` events) | Controlled by `OPENSRE_NO_TELEMETRY`; unrelated to your project credentials |
 
 <Info>
-  This is distinct from the [PostHog MCP integration](/posthog-mcp), which connects to PostHog's hosted Model Context Protocol (MCP) server to expose product analytics, feature flags, and HogQL tools directly to the agent.
+  For agent-driven PostHog exploration during incidents, use [PostHog (MCP)](/posthog-mcp). This page covers the env-configured REST bounce-rate client only.
 </Info>
+
+<Warning>
+  **Env-configured only — no CLI setup flow.** `opensre integrations setup posthog` and `opensre integrations verify posthog` configure **PostHog MCP**, not this REST integration. There is also no `opensre integrations verify` target for bounce-rate credentials yet. Setting `POSTHOG_*` vars loads the client library but does not start automatic background monitoring on its own.
+</Warning>
 
 ## Prerequisites
 
@@ -19,7 +31,7 @@ This integration uses the PostHog REST API to fetch session telemetry during SRE
 
 ## Setup
 
-The PostHog bounce-rate integration is configured exclusively using environment variables.
+The PostHog bounce-rate client is configured exclusively using environment variables.
 
 ### Environment variables
 
@@ -38,18 +50,33 @@ POSTHOG_BOUNCE_WINDOW=24h                           # Optional, defaults to 24h
 | --- | --- | --- |
 | `POSTHOG_PROJECT_ID` | — | **Required.** Your PostHog project ID |
 | `POSTHOG_PERSONAL_API_KEY` | — | **Required.** Your PostHog personal API key |
-| `POSTHOG_BASE_URL` | `https://us.i.posthog.com` | PostHog API instance base URL (use `https://eu.i.posthog.com` for EU SaaS) |
+| `POSTHOG_BASE_URL` | `https://us.i.posthog.com` | PostHog API instance base URL (use `https://eu.i.posthog.com` for EU SaaS, or your self-hosted origin) |
 | `POSTHOG_TIMEOUT_SECONDS` | `15.0` | Timeout in seconds for HTTP requests to the PostHog API |
-| `POSTHOG_BOUNCE_THRESHOLD` | `0.6` | Bounce rate threshold (as a decimal from `0.0` to `1.0`) above which alerting is triggered |
-| `POSTHOG_BOUNCE_WINDOW` | `24h` | Time window to query for calculating the bounce rate (e.g. `24h`, `48h`, `1h`) |
+| `POSTHOG_BOUNCE_THRESHOLD` | `0.6` | Bounce rate threshold (decimal `0.0`–`1.0`) above which evaluation reports an alert |
+| `POSTHOG_BOUNCE_WINDOW` | `24h` | Time window for the bounce-rate query; format `<number><unit>` where unit is `s`, `m`, `h`, `d`, or `w` (e.g. `24h`, `1h`) |
 
-## How Alerting Works
+## How bounce rate is evaluated
 
-OpenSRE automatically monitors your PostHog sessions under the hood. During each watchdog cycle, it queries your session data to compute the bounce rate (the percentage of sessions with a duration of 10 seconds or less).
+When the client runs a bounce-rate check, it posts a HogQL query to PostHog's `/api/projects/{id}/query/` endpoint. A session counts as a **bounce** if its duration is **10 seconds or less**.
 
-If the bounce rate exceeds your configured `POSTHOG_BOUNCE_THRESHOLD`, a watchdog alert is raised automatically:
-- **Warning Alert:** Triggered if the bounce rate is above the threshold but less than or equal to 90% (`0.9`).
-- **Critical Alert:** Triggered if the bounce rate is above 90% (`0.9`).
+If the calculated bounce rate exceeds `POSTHOG_BOUNCE_THRESHOLD`, the client returns an alert object with severity:
+
+- **Warning:** bounce rate is above the threshold but less than or equal to 90% (`0.9`).
+- **Critical:** bounce rate is above 90% (`0.9`).
+
+## Verify credentials
+
+Because `opensre integrations verify` does not cover this integration yet, validate connectivity manually:
+
+```bash
+uv run python -c "
+from integrations.posthog import posthog_config_from_env, validate_posthog_config
+cfg = posthog_config_from_env()
+print('missing POSTHOG_PROJECT_ID or POSTHOG_PERSONAL_API_KEY' if cfg is None else validate_posthog_config(cfg))
+"
+```
+
+A successful check prints `PostHogValidationResult(ok=True, detail='PostHog validated.')`.
 
 ## Troubleshooting
 
@@ -58,7 +85,7 @@ If the bounce rate exceeds your configured `POSTHOG_BOUNCE_THRESHOLD`, a watchdo
 | **Authentication failed (401)** | Confirm your `POSTHOG_PERSONAL_API_KEY` is correct and active. Verify it has sufficient read access to the project. |
 | **Project not found (404)** | Check that `POSTHOG_PROJECT_ID` is correct for the specified `POSTHOG_BASE_URL` instance. |
 | **Invalid bounce window error** | Ensure `POSTHOG_BOUNCE_WINDOW` follows the format `<number><unit>` (where unit is `s`, `m`, `h`, `d`, `w`), e.g., `24h` or `1h`. |
-| **No alerts generated** | Verify the calculated bounce rate is higher than the `POSTHOG_BOUNCE_THRESHOLD` (defaults to `0.6`, which is 60%). |
+| **Threshold never exceeded** | The client only reports an alert when bounce rate is above `POSTHOG_BOUNCE_THRESHOLD` (default `0.6`, i.e. 60%). Lower the threshold or widen `POSTHOG_BOUNCE_WINDOW` to test. |
 
 ## Security Best Practices
 
