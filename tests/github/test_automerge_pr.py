@@ -148,3 +148,43 @@ def test_ignores_mintlify_vale_spellcheck_failure() -> None:
     )
     assert green is True
     assert reason == "all checks green"
+
+
+def test_same_repo_closing_issue_numbers_filters_cross_repo() -> None:
+    pr = {
+        "closingIssuesReferences": [
+            {
+                "number": 1554,
+                "repository": {
+                    "name": "opensre",
+                    "owner": {"login": "Tracer-Cloud"},
+                },
+            },
+            {
+                "number": 99,
+                "repository": {
+                    "name": "other",
+                    "owner": {"login": "Tracer-Cloud"},
+                },
+            },
+            {
+                "number": "not-an-int",
+                "repository": {
+                    "name": "opensre",
+                    "owner": {"login": "Tracer-Cloud"},
+                },
+            },
+        ]
+    }
+    assert automerge_pr._same_repo_closing_issue_numbers(pr, "Tracer-Cloud/opensre") == [1554]
+
+
+def test_same_repo_closing_issue_numbers_empty_when_missing() -> None:
+    assert automerge_pr._same_repo_closing_issue_numbers({}, "Tracer-Cloud/opensre") == []
+    assert automerge_pr._same_repo_closing_issue_numbers({"closingIssuesReferences": []}, "bad") == []
+
+
+def test_is_already_closed_error() -> None:
+    assert automerge_pr._is_already_closed_error("HTTP 422: Issue #1554 is already closed") is True
+    assert automerge_pr._is_already_closed_error("GraphQL: Issue is not open") is True
+    assert automerge_pr._is_already_closed_error("Resource not accessible by integration") is False

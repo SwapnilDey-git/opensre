@@ -3,6 +3,10 @@ name: Auto-merge
 # Opt-in squash merge once all PR checks are green. Add the `automerge` label when the PR
 # is ready (Greptile 5/5, review done, etc.). Uses pull_request_target so fork PRs can merge
 # via GITHUB_TOKEN; the job only calls gh APIs and never executes PR head code.
+#
+# After merge, the script closes issues from the PR's closingIssuesReferences (Fixes/Closes/
+# Resolves #N). Native keyword auto-close does not run for GITHUB_TOKEN merges, so issues:write
+# plus an explicit close is required.
 on:
   pull_request_target:
     types: [labeled, synchronize, reopened]
@@ -18,6 +22,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   # PR number / commit SHA, not branch name: fork branches can share a name,

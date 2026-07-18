@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Merge a pull request when it is labeled automerge and CI checks are green."""
+"""Merge a pull request when it is labeled automerge and CI checks are green.
+
+Also closes issues linked via closing keywords (Fixes/Closes/Resolves #N). GitHub's
+native auto-close does not run when the merge is performed with GITHUB_TOKEN, so
+this script closes those issues explicitly after a successful merge.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ CHECK_RUN_PENDING_STATUSES = frozenset({"IN_PROGRESS", "QUEUED", "PENDING", "WAI
 CHECK_RUN_ALLOWED_CONCLUSIONS = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
 STATUS_CONTEXT_PENDING_STATES = frozenset({"PENDING", "EXPECTED"})
 STATUS_CONTEXT_ALLOWED_STATES = frozenset({"SUCCESS"})
+ALREADY_CLOSED_MARKERS = ("already closed", "not open", "is closed")
 
 
 def _check_display_name(check: dict[str, Any]) -> str:
@@ -100,6 +106,60 @@ def _checks_are_green(status_rollup: list[dict[str, Any]]) -> tuple[bool, str]:
     return True, "all checks green"
 
 
+def _same_repo_closing_issue_numbers(pr: dict[str, Any], repo: str) -> list[int]:
+    """Return issue numbers this PR should close in *repo* (owner/name)."""
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return []
+
+    numbers: list[int] = []
+    for ref in pr.get("closingIssuesReferences") or []:
+        ref_repo = ref.get("repository") or {}
+        ref_owner = (ref_repo.get("owner") or {}).get("login")
+        ref_name = ref_repo.get("name")
+        if ref_owner != owner or ref_name != name:
+            continue
+        number = ref.get("number")
+        if isinstance(number, int):
+            numbers.append(number)
+    return numbers
+
+
+def _is_already_closed_error(stderr: str) -> bool:
+    lowered = stderr.casefold()
+    return any(marker in lowered for marker in ALREADY_CLOSED_MARKERS)
+
+
+def _close_linked_issues(repo: str, pr_number: str, issue_numbers: list[int]) -> None:
+    """Close issues linked by Fixes/Closes/Resolves after a successful merge."""
+    for issue_number in issue_numbers:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "close",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--reason",
+                "completed",
+                "--comment",
+                f"Closed automatically by merge of #{pr_number}.",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(f"Closed issue #{issue_number}.")
+            continue
+        err = (result.stderr or result.stdout or "").strip()
+        if _is_already_closed_error(err):
+            print(f"Issue #{issue_number} already closed; skipping.")
+            continue
+        print(f"Warning: failed to close issue #{issue_number}: {err}", file=sys.stderr)
+
+
 def _run_gh(args: list[str]) -> Any:
     result = subprocess.run(
         ["gh", *args],
@@ -122,7 +182,7 @@ def main() -> int:
             "--repo",
             repo,
             "--json",
-            "baseRefName,isDraft,mergeable,mergeStateStatus,labels,state,statusCheckRollup,title",
+            "baseRefName,closingIssuesReferences,isDraft,mergeable,mergeStateStatus,labels,state,statusCheckRollup,title",
         ]
     )
 
@@ -153,6 +213,7 @@ def main() -> int:
         return 0
 
     title = pr["title"]
+    linked_issues = _same_repo_closing_issue_numbers(pr, repo)
     print(f"Merging PR #{pr_number}: {title}")
     subprocess.run(
         [
@@ -170,6 +231,8 @@ def main() -> int:
         check=True,
     )
     print(f"Merged PR #{pr_number}.")
+    if linked_issues:
+        _close_linked_issues(repo, pr_number, linked_issues)
     return 0
 
 
