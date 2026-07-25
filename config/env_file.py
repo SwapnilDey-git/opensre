@@ -150,7 +150,8 @@ def _persist_env_secret(key: str, value: str) -> str | None:
             delete_provider_auth(provider)
         else:
             delete_keyring_secret(key)
-            delete_fallback_secret(key)
+            with suppress(OSError):
+                delete_fallback_secret(key)
         return "keyring"
     try:
         if provider:

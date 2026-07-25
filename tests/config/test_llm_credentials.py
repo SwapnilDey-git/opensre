@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 
 import google.auth
 import keyring
+import pytest
 from google.auth.exceptions import DefaultCredentialsError
 
 import config.llm_credentials as llm_credentials
@@ -309,3 +312,84 @@ def test_get_keyring_setup_instructions_when_keyring_is_disabled(monkeypatch) ->
         "Secure local credential storage is disabled by OPENSRE_DISABLE_KEYRING.",
         "Unset OPENSRE_DISABLE_KEYRING and rerun `opensre onboard` to save OPENAI_API_KEY securely.",
     )
+
+
+def test_resolve_for_request_falls_back_when_keychain_raises_bare_runtime_error(
+    monkeypatch,
+) -> None:
+    """Greptile P1: SecretService can raise a bare RuntimeError (not KeyringError)
+    when D-Bus is unset. resolve_for_request must still check the fallback store
+    instead of letting that exception bypass it and crash request-time resolution.
+    """
+    monkeypatch.delenv("OPENSRE_DISABLE_KEYRING", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    def _boom(_service: str, _username: str) -> str:
+        raise RuntimeError("Unable to initialize SecretService: DBUS unset")
+
+    monkeypatch.setattr(llm_keyring.keyring, "get_password", _boom)
+    llm_keyring.save_fallback_secret("DEEPSEEK_API_KEY", "fallback-secret")
+
+    resolution = resolve_for_request("deepseek")
+
+    assert resolution.ok is True
+    assert resolution.api_key == "fallback-secret"
+    assert resolution.source == "keyring"
+
+
+def test_delete_clears_fallback_secret_not_just_keyring(monkeypatch) -> None:
+    """Greptile P1: a key saved to the fallback store during onboarding must not
+    keep authenticating after `opensre auth logout` — deleting only the keyring
+    entry left the fallback copy resolvable."""
+    monkeypatch.delenv("OPENSRE_DISABLE_KEYRING", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    previous_backend = keyring.get_keyring()
+    keyring.set_keyring(MemoryKeyring())
+    try:
+        llm_keyring.save_fallback_secret("DEEPSEEK_API_KEY", "stale-fallback-secret")
+
+        from config.llm_auth.credentials import delete as delete_provider_auth
+
+        delete_provider_auth("deepseek")
+
+        assert llm_keyring.resolve_fallback_secret("DEEPSEEK_API_KEY") == ""
+        assert resolve_for_request("deepseek").ok is False
+    finally:
+        keyring.set_keyring(previous_backend)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "getuid") or os.getuid() == 0,
+    reason="root bypasses file permission checks; permission bits are POSIX-only",
+)
+def test_fallback_store_is_created_with_owner_only_permissions(monkeypatch, tmp_path) -> None:
+    """Greptile P1 security: the old write_text() + best-effort chmod() left a
+    window where the fallback file was briefly (or permanently, if chmod failed)
+    readable beyond the owner. The file must be owner-only from creation."""
+    fallback_path = tmp_path / "secrets.local.json"
+    monkeypatch.setenv("OPENSRE_FALLBACK_SECRETS_PATH", str(fallback_path))
+
+    llm_keyring.save_fallback_secret("SOME_TOKEN", "top-secret")
+
+    mode = stat.S_IMODE(fallback_path.stat().st_mode)
+    assert mode == stat.S_IRUSR | stat.S_IWUSR
+
+
+def test_fallback_store_write_failure_is_not_swallowed(monkeypatch, tmp_path) -> None:
+    """Greptile P1 security: a failure to secure a *new* secret's permissions
+    must fail the save, not silently persist the file with broader access.
+
+    Targets ``os.open`` (the platform-independent enforcement point) rather
+    than the POSIX-only ``os.chmod`` re-assertion, so this holds on Windows too.
+    """
+    fallback_path = tmp_path / "secrets.local.json"
+    monkeypatch.setenv("OPENSRE_FALLBACK_SECRETS_PATH", str(fallback_path))
+
+    def _boom(_path, _flags, _mode):
+        raise OSError("cannot create file with the requested permissions")
+
+    monkeypatch.setattr(llm_keyring.os, "open", _boom)
+
+    with pytest.raises(OSError):
+        llm_keyring.save_fallback_secret("SOME_TOKEN", "top-secret")

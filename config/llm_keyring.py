@@ -254,11 +254,25 @@ def _read_fallback_store() -> dict[str, str]:
 
 
 def _write_fallback_store(payload: Mapping[str, str]) -> None:
+    """Write the fallback store with owner-only permissions from creation.
+
+    Opens with mode 0o600 up front so a brand-new file is never briefly
+    readable under the process umask, then re-asserts that mode in case the
+    file pre-existed with looser permissions. Unlike the old write_text() +
+    best-effort chmod(), a permission failure here is NOT suppressed: a
+    plaintext secret we can't confine to the owner should fail the save
+    rather than land on disk with broader-than-promised access.
+    """
     path = fallback_store_path()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-    with suppress(OSError):
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    serialized = json.dumps(payload, sort_keys=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fallback_file:
+            fallback_file.write(serialized)
+    finally:
+        if os.name != "nt":
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
 
 
 def save_fallback_secret(env_var: str, value: str) -> None:
@@ -294,16 +308,19 @@ def save_secret_with_fallback(env_var: str, value: str) -> str:
 
     Returns ``"keyring"`` or ``"fallback"`` for the tier actually used, so
     callers can tell the user their credential is not protected by the OS
-    keychain. Raises only when neither tier can persist the value.
+    keychain. Raises only when a *save* can't be made secure on either tier —
+    a failure while merely deleting a now-stale fallback copy is swallowed
+    (best-effort cleanup only) rather than reported as a failed save/delete,
+    since the copy was already written with owner-only permissions and losing
+    the cleanup is a stale-file nuisance, not a new secret exposed.
     """
     if not value.strip():
         delete_keyring_secret(env_var)
-        delete_fallback_secret(env_var)
+        with suppress(OSError):
+            delete_fallback_secret(env_var)
         return "keyring"
     try:
         save_keyring_secret(env_var, value)
-        delete_fallback_secret(env_var)
-        return "keyring"
     except RuntimeError:
         try:
             save_fallback_secret(env_var, value)
@@ -313,6 +330,9 @@ def save_secret_with_fallback(env_var: str, value: str) -> str:
                 f"and the local fallback store could not be written either: {fallback_exc}."
             ) from fallback_exc
         return "fallback"
+    with suppress(OSError):
+        delete_fallback_secret(env_var)
+    return "keyring"
 
 
 def resolve_secret_with_fallback(env_var: str) -> str:

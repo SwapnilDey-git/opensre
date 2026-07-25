@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -356,12 +357,14 @@ def resolve_for_request(provider: str) -> CredentialResolution:
         if not keyring_is_disabled():
             try:
                 key = read_keychain_secret(spec.api_key_env)
-            except keyring.errors.KeyringError:
+            except (keyring.errors.KeyringError, RuntimeError, OSError):
                 # The backend itself couldn't be reached (e.g. no D-Bus/Secret
-                # Service session, or a locked macOS Keychain). Not evidence
-                # the credential is missing — the fallback store (populated by
-                # save_api_key when onboarding hit this same failure, see
-                # #1403/#3348) is checked below before giving up.
+                # Service session — SecretService can raise a bare
+                # RuntimeError here, not just KeyringError — or a locked
+                # macOS Keychain). Not evidence the credential is missing —
+                # the fallback store (populated by save_api_key when
+                # onboarding hit this same failure, see #1403/#3348) is
+                # checked below before giving up.
                 keychain_unreachable = True
 
         if not key:
@@ -482,9 +485,16 @@ def delete(provider: str) -> None:
     """Delete OpenSRE-managed provider auth metadata and API key when applicable."""
     spec = require_provider_spec(provider)
     if spec.uses_open_sre_api_key:
-        from config.llm_keyring import delete_keyring_secret
+        from config.llm_keyring import delete_fallback_secret, delete_keyring_secret
 
         delete_keyring_secret(spec.api_key_env)
+        # A key saved while the keyring was unavailable lives in the fallback
+        # store instead — deleting only the keyring entry would leave that
+        # copy resolvable, so a "deleted" credential keeps authenticating.
+        # Best-effort: a permission failure while rewriting the store to
+        # drop this entry shouldn't turn a successful logout into a crash.
+        with suppress(OSError):
+            delete_fallback_secret(spec.api_key_env)
     delete_provider_auth_record(spec.value)
 
 
