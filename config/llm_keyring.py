@@ -38,7 +38,6 @@ import keyring
 import keyring.errors
 
 import platform
-
 from config.constants.paths import OPENSRE_HOME_DIR
 
 _KEYRING_SERVICE: Final = "opensre.llm"

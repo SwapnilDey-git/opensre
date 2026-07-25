@@ -32,8 +32,11 @@ from pathlib import Path
 from config.llm_auth.credentials import delete as delete_provider_auth
 from config.llm_auth.credentials import save_api_key
 from config.llm_auth.provider_catalog import API_KEY_PROVIDER_ENVS
-from config.llm_credentials import delete_fallback_secret, delete_keyring_secret
-from config.llm_credentials import save_secret_with_fallback
+from config.llm_credentials import (
+    delete_fallback_secret,
+    delete_keyring_secret,
+    save_secret_with_fallback,
+)
 from config.local_env import get_project_env_path
 
 PROJECT_ENV_PATH = get_project_env_path()
