@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -144,3 +146,68 @@ def test_get_grafana_client_from_credentials_evicts_stale_cache_entry() -> None:
     ]
     assert len(matching) == 1
     assert matching[0].read_token == "token-two"
+
+
+def test_get_grafana_client_from_credentials_normalizes_trailing_slash() -> None:
+    """A trailing slash on the endpoint must not create a second cache entry
+    for what GrafanaAccountConfig treats as the same instance_url — otherwise
+    the two entries never get evicted for each other and the client cache
+    grows a duplicate on every call that varies only in a trailing slash."""
+    with _patched_discovery():
+        first = get_grafana_client_from_credentials(
+            endpoint="https://grafana.example.com",
+            api_key="token",
+            account_id="user_integration",
+        )
+        second = get_grafana_client_from_credentials(
+            endpoint="https://grafana.example.com/",
+            api_key="token",
+            account_id="user_integration",
+        )
+
+    from integrations.grafana.client import _grafana_client_cache
+
+    assert first is second
+    assert len(_grafana_client_cache) == 1
+
+
+def test_get_grafana_client_from_credentials_is_thread_safe() -> None:
+    """Concurrent calls with identical (new) credentials must not both pay for
+    the blocking datasource-discovery request — the check-build-insert
+    sequence is locked, so only the first caller through performs discovery
+    and every other caller gets the client it inserted."""
+    call_count = 0
+    call_count_lock = threading.Lock()
+
+    def _slow_discovery(_self) -> dict[str, str]:
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        time.sleep(0.05)
+        return {}
+
+    results: list[object] = []
+    results_lock = threading.Lock()
+
+    def _call() -> None:
+        client = get_grafana_client_from_credentials(
+            endpoint="https://grafana.example.com",
+            api_key="same-token",
+            account_id="user_integration",
+        )
+        with results_lock:
+            results.append(client)
+
+    with patch(
+        "integrations.grafana.client.GrafanaClient.discover_datasource_uids",
+        _slow_discovery,
+    ):
+        threads = [threading.Thread(target=_call) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+    assert call_count == 1
+    assert len(results) == 5
+    assert all(client is results[0] for client in results)

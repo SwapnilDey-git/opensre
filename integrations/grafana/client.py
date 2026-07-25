@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 
 from integrations.grafana.base import GrafanaClientBase
 from integrations.grafana.config import GrafanaAccountConfig
@@ -14,6 +15,10 @@ from integrations.grafana.tempo import TempoMixin
 logger = logging.getLogger(__name__)
 
 _grafana_client_cache: dict[str, GrafanaClient] = {}
+# Guards the whole check-build-insert sequence below, including the blocking
+# discover_datasource_uids() HTTP call, so concurrent callers with the same
+# (new) credentials can't both miss the cache and both pay for discovery.
+_grafana_client_cache_lock = threading.Lock()
 
 
 def _credential_fingerprint(
@@ -69,6 +74,7 @@ def get_grafana_client_from_credentials(
     ca_bundle: str = "",
 ) -> GrafanaClient:
     """Create a Grafana client from integration credentials."""
+    normalized_endpoint = endpoint.rstrip("/")
     fingerprint = _credential_fingerprint(
         api_key=api_key,
         username=username,
@@ -76,63 +82,70 @@ def get_grafana_client_from_credentials(
         verify_ssl=verify_ssl,
         ca_bundle=ca_bundle,
     )
-    cache_key_prefix = f"creds_{account_id}_{endpoint}_"
+    # Keyed on the normalized endpoint so a trailing slash doesn't create a
+    # second cache identity for what GrafanaAccountConfig treats as the same
+    # instance_url.
+    cache_key_prefix = f"creds_{account_id}_{normalized_endpoint}_"
     cache_key = f"{cache_key_prefix}{fingerprint}"
-    if cache_key in _grafana_client_cache:
-        return _grafana_client_cache[cache_key]
 
-    # Drop any client cached under the old credentials for this account_id +
-    # endpoint — it is superseded and would otherwise linger indefinitely.
-    for stale_key in [
-        key
-        for key in _grafana_client_cache
-        if key.startswith(cache_key_prefix) and key != cache_key
-    ]:
-        del _grafana_client_cache[stale_key]
+    with _grafana_client_cache_lock:
+        if cache_key in _grafana_client_cache:
+            return _grafana_client_cache[cache_key]
 
-    config = GrafanaAccountConfig(
-        account_id=account_id,
-        instance_url=endpoint.rstrip("/"),
-        read_token=api_key,
-        username=username,
-        password=password,
-        verify_ssl=verify_ssl,
-        ca_bundle=ca_bundle,
-    )
-    client = GrafanaClient(config=config)
+        # Drop any client cached under the old credentials for this
+        # account_id + endpoint — it is superseded and would otherwise
+        # linger indefinitely.
+        for stale_key in [
+            key
+            for key in _grafana_client_cache
+            if key.startswith(cache_key_prefix) and key != cache_key
+        ]:
+            del _grafana_client_cache[stale_key]
 
-    discovered = client.discover_datasource_uids()
-    if discovered:
         config = GrafanaAccountConfig(
             account_id=account_id,
-            instance_url=endpoint.rstrip("/"),
+            instance_url=normalized_endpoint,
             read_token=api_key,
             username=username,
             password=password,
             verify_ssl=verify_ssl,
             ca_bundle=ca_bundle,
-            loki_datasource_uid=discovered.get("loki_uid", ""),
-            tempo_datasource_uid=discovered.get("tempo_uid", ""),
-            mimir_datasource_uid=discovered.get("mimir_uid", ""),
         )
         client = GrafanaClient(config=config)
-        logger.info(
-            "[grafana] Client ready for account_id=%s with datasource discovery status: loki=%s tempo=%s mimir=%s",
-            account_id,
-            config.loki_datasource_uid,
-            config.tempo_datasource_uid,
-            config.mimir_datasource_uid,
-        )
-    else:
-        logger.warning(
-            "[grafana] Could not discover datasource UIDs for account_id=%s — queries will fail",
-            account_id,
-        )
 
-    _grafana_client_cache[cache_key] = client
-    return client
+        discovered = client.discover_datasource_uids()
+        if discovered:
+            config = GrafanaAccountConfig(
+                account_id=account_id,
+                instance_url=normalized_endpoint,
+                read_token=api_key,
+                username=username,
+                password=password,
+                verify_ssl=verify_ssl,
+                ca_bundle=ca_bundle,
+                loki_datasource_uid=discovered.get("loki_uid", ""),
+                tempo_datasource_uid=discovered.get("tempo_uid", ""),
+                mimir_datasource_uid=discovered.get("mimir_uid", ""),
+            )
+            client = GrafanaClient(config=config)
+            logger.info(
+                "[grafana] Client ready for account_id=%s with datasource discovery status: loki=%s tempo=%s mimir=%s",
+                account_id,
+                config.loki_datasource_uid,
+                config.tempo_datasource_uid,
+                config.mimir_datasource_uid,
+            )
+        else:
+            logger.warning(
+                "[grafana] Could not discover datasource UIDs for account_id=%s — queries will fail",
+                account_id,
+            )
+
+        _grafana_client_cache[cache_key] = client
+        return client
 
 
 def clear_grafana_client_cache() -> None:
     """Drop every cached client; test-only, real processes never need this."""
-    _grafana_client_cache.clear()
+    with _grafana_client_cache_lock:
+        _grafana_client_cache.clear()
